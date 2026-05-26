@@ -369,8 +369,10 @@ body {
 .a4-sheet {
     position: relative;
     background: white;
-    width: 794px; /* A4 width at 96 DPI */
-    height: 1123px; /* A4 height at 96 DPI */
+    width: 100%;
+    max-width: 794px; /* A4 width at 96 DPI */
+    height: auto;
+    aspect-ratio: 794 / 1123;
     box-shadow: 
         0 0 0 1px rgba(0,0,0,0.05),
         0 10px 30px rgba(0,0,0,0.08),
@@ -378,12 +380,12 @@ body {
     border-radius: 2px;
     flex-shrink: 0;
     overflow: hidden;
-    transition: transform 0.3s ease, width 0.3s ease, height 0.3s ease;
+    transition: transform 0.3s ease, width 0.3s ease, height 0.3s ease, max-width 0.3s ease;
 }
 
 .a4-sheet.layout-ppt {
-    width: 960px; /* 16:9 at 96 DPI */
-    height: 540px;
+    max-width: 960px; /* 16:9 at 96 DPI */
+    aspect-ratio: 960 / 540;
 }
 
 /* Inline Text Editor Overlay */
@@ -397,24 +399,27 @@ body {
     min-width: 50px;
     min-height: 1.2em;
     outline: 2px solid var(--primary);
-    background: white;
-    padding: 8px 12px;
+    background: transparent;
+    padding: 4px 2px;
     pointer-events: auto;
     white-space: pre-wrap;
     word-wrap: break-word;
     font-family: 'Inter', sans-serif;
     color: #000;
     line-height: 1.2;
-    box-shadow: var(--shadow-medium);
+    box-shadow: 0 0 0 3px rgba(0,122,255,0.15), var(--shadow-medium);
     border-radius: var(--radius-sm);
+    caret-color: var(--primary);
+}
+
+@keyframes toolbar-slide-up {
+    from { opacity: 0; transform: translateY(6px) scale(0.97); }
+    to   { opacity: 1; transform: translateY(0)  scale(1); }
 }
 
 /* Floating Text Formatting Toolbar - Professional Dark Mode */
 .text-format-toolbar {
-    position: absolute;
-    bottom: calc(100% + 40px);
-    left: 50%;
-    transform: translateX(-50%);
+    position: fixed;
     background: #1e1e1e !important;
     border: 1px solid #3c3c3c !important;
     border-radius: 10px !important;
@@ -425,12 +430,13 @@ body {
     gap: 0 !important;
     box-shadow: 0 10px 40px rgba(0,0,0,0.6) !important;
     pointer-events: auto;
-    animation: toolbar-slide-up 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+    animation: toolbar-slide-up 0.2s cubic-bezier(0.16, 1, 0.3, 1);
     white-space: nowrap;
     color: white !important;
-    z-index: 2000 !important;
+    z-index: 9999 !important;
     box-sizing: border-box !important;
     min-height: 80px;
+    transition: left 0.08s ease, top 0.08s ease;
 }
 
 .text-format-toolbar::after {
@@ -669,10 +675,44 @@ canvas {
     .toolbar {
         padding: 0.5rem;
         gap: 0.5rem;
+        height: auto;
+        flex-wrap: nowrap;
+        justify-content: flex-start;
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+        -ms-overflow-style: none;
+        scrollbar-width: none;
     }
     
-    .tool-btn span {
+    .toolbar::-webkit-scrollbar {
         display: none;
+    }
+    
+    .toolbar-left, .toolbar-center, .toolbar-right {
+        flex-wrap: nowrap;
+        justify-content: flex-start;
+    }
+    
+    .v-divider {
+        display: none;
+    }
+    
+    .premium-btn span, .side-btn span {
+        display: none;
+    }
+    
+    .properties-bar {
+        padding: 0.5rem;
+        flex-wrap: wrap;
+        height: auto;
+        justify-content: center;
+        gap: 0.5rem;
+    }
+
+    .prop-group {
+        flex-wrap: wrap;
+        justify-content: center;
+        gap: 0.5rem;
     }
     
     .canvas-container {
@@ -683,6 +723,25 @@ canvas {
         width: 100%;
         height: auto;
         aspect-ratio: 794 / 1123;
+    }
+    
+    .a4-sheet.layout-ppt {
+        width: 100%;
+        height: auto;
+        aspect-ratio: 960 / 540;
+    }
+    
+    .text-format-toolbar {
+        max-width: 90vw;
+        overflow-x: auto;
+        justify-content: flex-start;
+        -webkit-overflow-scrolling: touch;
+        -ms-overflow-style: none;
+        scrollbar-width: none;
+    }
+    
+    .text-format-toolbar::-webkit-scrollbar {
+        display: none;
     }
 }
 

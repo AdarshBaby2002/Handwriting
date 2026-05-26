@@ -166,10 +166,20 @@ function attachEventListeners() {
         setTextColor(e.target.value);
         document.getElementById('textColorIndicator').style.background = e.target.value;
     };
+    document.getElementById('fmtColor').addEventListener('mousedown', () => {
+        // Save selection before the color picker steals focus
+        const sel = window.getSelection();
+        state._savedSelRange = (sel && sel.rangeCount > 0) ? sel.getRangeAt(0).cloneRange() : null;
+    });
     document.getElementById('fmtBgColor').oninput = (e) => {
         setTextBgColor(e.target.value);
         document.getElementById('bgColorIndicator').style.background = e.target.value;
     };
+    document.getElementById('fmtBgColor').addEventListener('mousedown', () => {
+        const sel = window.getSelection();
+        state._savedSelRange = (sel && sel.rangeCount > 0) ? sel.getRangeAt(0).cloneRange() : null;
+    });
+
 
     // Global Paste handler
     window.addEventListener('paste', (e) => {
@@ -196,9 +206,11 @@ function attachEventListeners() {
         }
     });
 
-    // Click outside to close editor
+    // Click outside to close editor (but not when clicking the format toolbar)
     window.addEventListener('mousedown', (e) => {
-        if (state.textEditing && !e.target.closest('#textEditorOverlay')) {
+        if (state.textEditing &&
+            !e.target.closest('#textEditorOverlay') &&
+            !e.target.closest('#floatingFormatToolbar')) {
             closeTextEditor();
         }
     });
@@ -260,6 +272,7 @@ function attachEventListeners() {
     });
     document.getElementById('inlineEditor').oninput = (e) => {
         if (state.textEditing) {
+            state.textEditing.obj.richHtml = e.target.innerHTML;
             state.textEditing.obj.text = e.target.innerText;
             saveToLocalStorage();
             // Don't call redraw() here as it would flicker (drawText returns early)
@@ -331,7 +344,7 @@ function onPointerDown(e) {
 
             state.resizingText = {
                 obj: state.selectedText,
-                initialSize: state.selectedText.size,
+                initialWidth: getTextBox(state.selectedText).w,
                 initialPos: pos,
                 handle: handle,
                 anchor: anchor
@@ -433,17 +446,31 @@ function onPointerMove(e) {
         const handle = state.resizingText.handle;
         const anchor = state.resizingText.anchor;
         
-        // Calculate distance from anchor to current pointer
-        const initialDist = Math.sqrt(Math.pow(state.resizingText.initialPos.x - anchor.x, 2) + Math.pow(state.resizingText.initialPos.y - anchor.y, 2));
-        const currentDist = Math.sqrt(Math.pow(pos.x - anchor.x, 2) + Math.pow(pos.y - anchor.y, 2));
+        let newWidth = 50;
+        if (handle.id === 'nw' || handle.id === 'sw') {
+            newWidth = Math.max(50, anchor.x - pos.x);
+            obj.x = anchor.x - newWidth;
+        } else {
+            newWidth = Math.max(50, pos.x - anchor.x);
+            obj.x = anchor.x;
+        }
+        obj.width = newWidth;
         
-        const scale = currentDist / initialDist;
-        obj.size = Math.max(8, Math.min(200, state.resizingText.initialSize * scale));
-        
-        // Dynamic Reflow: Re-wrap text based on new size
-        // We replace newlines with spaces to allow "reflowing" back to previous lines
+        // Dynamic Reflow: Re-wrap text based on new width
         const unwrapped = obj.text.replace(/\n/g, ' ');
-        obj.text = wrapText(unwrapped, obj.size, getTextRightBoundary(obj), obj.x);
+        obj.text = wrapText(unwrapped, obj.size, obj.x + obj.width, obj.x);
+        
+        if (state.textEditing && state.textEditing.obj === obj) {
+            const editor = document.getElementById('inlineEditor');
+            const canvasRect = state.canvas.getBoundingClientRect();
+            const scale = canvasRect.width / state.width;
+            
+            editor.style.width = (obj.width * scale) + 'px';
+            editor.style.maxWidth = 'none';
+            
+            const overlay = document.getElementById('textEditorOverlay');
+            overlay.style.left = (obj.x * scale) + 'px';
+        }
     } else if (state.draggingText) {
         state.draggingText.obj.x = pos.x - state.draggingText.offset.x;
         state.draggingText.obj.y = pos.y - state.draggingText.offset.y;
@@ -576,11 +603,188 @@ function drawStroke(stroke) {
     ctx.stroke();
 }
 
+/**
+ * Converts an innerHTML string into a flat array of styled text segments
+ * for canvas rendering. Each segment carries its own style properties.
+ * @param {string} html - The innerHTML to parse
+ * @param {object} base - Base style from the text object
+ * @returns {Array<{text:string, bold:boolean, italic:boolean, underline:boolean, color:string, bgColor:string, size:number}>}
+ */
+function parseHtmlToSegments(html, base) {
+    const container = document.createElement('div');
+    container.innerHTML = html;
+    const segments = [];
+
+    function resolveColor(cssColor) {
+        if (!cssColor || cssColor === 'inherit') return null;
+        // execCommand sometimes returns rgb(...), convert to hex
+        const m = cssColor.match(/^rgb\((\d+),\s*(\d+),\s*(\d+)\)$/);
+        if (m) {
+            return '#' + [m[1], m[2], m[3]].map(n => parseInt(n).toString(16).padStart(2, '0')).join('');
+        }
+        return cssColor;
+    }
+
+    function walk(node, style) {
+        if (node.nodeType === Node.TEXT_NODE) {
+            const txt = node.textContent;
+            if (txt) {
+                // Split on newlines within the text node itself
+                const parts = txt.split('\n');
+                parts.forEach((part, i) => {
+                    if (i > 0) segments.push({ ...style, text: '\n', isNewline: true });
+                    if (part) segments.push({ ...style, text: part });
+                });
+            }
+            return;
+        }
+
+        if (node.nodeType !== Node.ELEMENT_NODE) return;
+
+        const tag = node.nodeName.toUpperCase();
+
+        // Block-level elements produce a newline before their content (except first)
+        const isBlock = ['DIV', 'P', 'LI', 'UL', 'OL', 'BLOCKQUOTE'].includes(tag);
+        if (isBlock && segments.length > 0 && !segments[segments.length - 1].isNewline) {
+            segments.push({ ...style, text: '\n', isNewline: true });
+        }
+
+        if (tag === 'BR') {
+            segments.push({ ...style, text: '\n', isNewline: true });
+            return;
+        }
+
+        // Inherit style and augment based on element tag/inline style
+        const s = { ...style };
+        if (tag === 'B' || tag === 'STRONG') s.bold = true;
+        if (tag === 'I' || tag === 'EM')     s.italic = true;
+        if (tag === 'U')                     s.underline = true;
+
+        if (node.style) {
+            const fw = node.style.fontWeight;
+            if (fw === 'bold' || fw === '700' || parseInt(fw) >= 700) s.bold = true;
+            if (node.style.fontStyle === 'italic')   s.italic = true;
+            if ((node.style.textDecoration || '').includes('underline')) s.underline = true;
+            const col = resolveColor(node.style.color);
+            if (col) s.color = col;
+            const bg = resolveColor(node.style.backgroundColor);
+            if (bg && bg !== 'transparent') s.bgColor = bg;
+            if (node.style.fontSize) {
+                // fontSize in editor is scaled by canvasScale, store in canvas pixels
+                const canvasScale = state.canvas.getBoundingClientRect().width / state.width;
+                const editorPx = parseFloat(node.style.fontSize);
+                if (!isNaN(editorPx) && canvasScale > 0) {
+                    s.size = editorPx / canvasScale;
+                }
+            }
+        }
+
+        node.childNodes.forEach(child => walk(child, s));
+
+        // After block element: newline
+        if (isBlock && segments.length > 0 && !segments[segments.length - 1].isNewline) {
+            segments.push({ ...style, text: '\n', isNewline: true });
+        }
+    }
+
+    walk(container, base);
+
+    // Remove trailing newline segments
+    while (segments.length > 0 && segments[segments.length - 1].isNewline) {
+        segments.pop();
+    }
+
+    return segments;
+}
+
+/**
+ * Renders a text object that has richHtml on the canvas,
+ * drawing each formatted segment independently.
+ */
+function drawTextRich(textObj) {
+    const ctx = state.ctx;
+
+    const base = {
+        bold:      textObj.bold      || false,
+        italic:    textObj.italic    || false,
+        underline: textObj.underline || false,
+        color:     textObj.color     || '#000000',
+        bgColor:   null,
+        size:      textObj.size      || 18,
+        fontFamily: textObj.fontFamily || 'Inter, sans-serif'
+    };
+
+    const segments = parseHtmlToSegments(textObj.richHtml, base);
+
+    // Split segments into lines on newline markers
+    const lines = [[]];
+    segments.forEach(seg => {
+        if (seg.isNewline) {
+            lines.push([]);
+        } else {
+            lines[lines.length - 1].push(seg);
+        }
+    });
+
+    const lineHeight = textObj.size * 1.2;
+    const customIndent = textObj.indent || 0;
+
+    ctx.save();
+    ctx.textBaseline = 'top';
+
+    lines.forEach((segs, lineIdx) => {
+        const y = textObj.y + lineIdx * lineHeight;
+        let x = textObj.x + customIndent;
+
+        segs.forEach(seg => {
+            const segSize = seg.size || textObj.size;
+            const fontParts = [];
+            if (seg.italic) fontParts.push('italic');
+            if (seg.bold)   fontParts.push('bold');
+            fontParts.push(`${segSize}px`);
+            fontParts.push(textObj.fontFamily || 'Inter, sans-serif');
+            ctx.font = fontParts.join(' ');
+
+            const w = ctx.measureText(seg.text).width;
+
+            // Draw background highlight
+            if (seg.bgColor && seg.bgColor !== 'transparent') {
+                ctx.fillStyle = seg.bgColor;
+                ctx.fillRect(x, y, w, segSize * 1.2);
+            }
+
+            // Draw text
+            ctx.fillStyle = seg.color || textObj.color || '#000000';
+            ctx.fillText(seg.text, x, y);
+
+            // Draw underline
+            if (seg.underline) {
+                ctx.beginPath();
+                ctx.strokeStyle = seg.color || textObj.color || '#000000';
+                ctx.lineWidth = Math.max(1, segSize / 15);
+                ctx.moveTo(x, y + segSize + 1);
+                ctx.lineTo(x + w, y + segSize + 1);
+                ctx.stroke();
+            }
+
+            x += w;
+        });
+    });
+
+    ctx.restore();
+}
+
 function drawText(textObj) {
     const ctx = state.ctx;
     
     // Don't draw text if it's currently being edited inline
     if (state.textEditing && state.textEditing.obj === textObj) return;
+
+    // Route to rich renderer if richHtml is stored
+    if (textObj.richHtml) {
+        drawTextRich(textObj);
+        return;
+    }
 
     ctx.save();
     
@@ -643,6 +847,7 @@ function drawText(textObj) {
     });
     ctx.restore();
 }
+
 
 function drawSelectionLasso() {
     const ctx = state.ctx;
@@ -786,18 +991,28 @@ function openTextEditor(textObj, clickPos = null) {
     overlay.style.top = (textObj.y * scale) + 'px';
     overlay.style.display = 'block';
     
-    editor.innerText = textObj.text;
+    // Load rich HTML if available, otherwise use plain text
+    if (textObj.richHtml) {
+        editor.innerHTML = textObj.richHtml;
+    } else {
+        editor.innerText = textObj.text;
+    }
     editor.style.fontSize = (textObj.size * scale) + 'px';
-    editor.style.color = textObj.color;
-    editor.style.fontWeight = textObj.bold ? 'bold' : 'normal';
-    editor.style.fontStyle = textObj.italic ? 'italic' : 'normal';
-    editor.style.textDecoration = textObj.underline ? 'underline' : 'none';
+    editor.style.color = textObj.color || '#000000';
+    // Base styles — per-word formatting is inside the innerHTML spans
+    editor.style.fontWeight = 'normal';
+    editor.style.fontStyle = 'normal';
+    editor.style.textDecoration = 'none';
     editor.style.textAlign = textObj.align || 'left';
     editor.style.width = textObj.width ? (textObj.width * scale) + 'px' : 'auto';
     editor.style.maxWidth = ((getTextRightBoundary(textObj) - box.x) * scale) + 'px';
     
-    // Update toolbar buttons
+    // Show the format toolbar immediately when editor opens
     updateFormatToolbar(textObj);
+    
+    // Wire up selectionchange so toolbar always reflects cursor/selection state
+    state._selectionChangeHandler = () => syncToolbarToSelection();
+    document.addEventListener('selectionchange', state._selectionChangeHandler);
     
     redraw(); // Redraw will hide the text on canvas
     
@@ -848,10 +1063,17 @@ function openTextEditor(textObj, clickPos = null) {
 function closeTextEditor() {
     if (!state.textEditing) return;
     
+    // Remove the selection-sync listener
+    if (state._selectionChangeHandler) {
+        document.removeEventListener('selectionchange', state._selectionChangeHandler);
+        state._selectionChangeHandler = null;
+    }
+    
     const editor = document.getElementById('inlineEditor');
     const obj = state.textEditing.obj;
     
-    // Save exactly what is in the editor without forced wrapping
+    // Save both rich HTML and plain text
+    obj.richHtml = editor.innerHTML;
     obj.text = editor.innerText;
     
     state.textEditing = null;
@@ -866,19 +1088,48 @@ function closeTextEditor() {
 }
 
 function toggleFormat(type) {
-    const obj = state.textEditing ? state.textEditing.obj : state.selectedText;
-    if (!obj) return;
+    const editor = document.getElementById('inlineEditor');
     
-    obj[type] = !obj[type];
-    
-    // Update editor style if active
     if (state.textEditing) {
-        const editor = document.getElementById('inlineEditor');
-        if (type === 'bold') editor.style.fontWeight = obj.bold ? 'bold' : 'normal';
-        if (type === 'italic') editor.style.fontStyle = obj.italic ? 'italic' : 'normal';
-        if (type === 'underline') editor.style.textDecoration = obj.underline ? 'underline' : 'none';
+        // Clicking a toolbar button can steal focus and collapse the selection.
+        // Save the selection range first, then restore it before execCommand.
+        const savedSel = window.getSelection();
+        let savedRange = null;
+        if (savedSel && savedSel.rangeCount > 0) {
+            savedRange = savedSel.getRangeAt(0).cloneRange();
+        }
+        
+        editor.focus();
+        
+        // Restore the selection if it was lost
+        if (savedRange) {
+            const sel = window.getSelection();
+            sel.removeAllRanges();
+            sel.addRange(savedRange);
+        }
+        
+        if (type === 'bold')      document.execCommand('bold',      false, null);
+        if (type === 'italic')    document.execCommand('italic',    false, null);
+        if (type === 'underline') document.execCommand('underline', false, null);
+        if (type === 'isBullet') {
+            document.execCommand('insertUnorderedList', false, null);
+        }
+        // Save rich HTML immediately and sync toolbar to new state
+        state.textEditing.obj.richHtml = editor.innerHTML;
+        state.textEditing.obj.text     = editor.innerText;
+        saveToLocalStorage();
+        syncToolbarToSelection();
+        return;
     }
     
+    // No editor open — apply to whole object
+    const obj = state.selectedText;
+    if (!obj) return;
+    obj[type] = !obj[type];
+    // Also update richHtml if present so re-opening the editor reflects the change
+    if (obj.richHtml) {
+        obj.richHtml = null; // reset so openTextEditor re-generates from plain text
+    }
     updateFormatToolbar(obj);
     saveToLocalStorage();
     redraw();
@@ -924,7 +1175,24 @@ function setTextColor(color) {
     
     if (state.textEditing) {
         const editor = document.getElementById('inlineEditor');
-        editor.style.color = color;
+        // Restore saved selection before applying color
+        if (state._savedSelRange) {
+            editor.focus();
+            const sel = window.getSelection();
+            sel.removeAllRanges();
+            sel.addRange(state._savedSelRange);
+        }
+        const sel = window.getSelection();
+        const hasSelection = sel && sel.rangeCount > 0 && !sel.isCollapsed;
+        if (hasSelection) {
+            document.execCommand('foreColor', false, color);
+            obj.richHtml = editor.innerHTML;
+            obj.text     = editor.innerText;
+        } else {
+            editor.style.color = color;
+        }
+        saveToLocalStorage();
+        return;
     }
     
     saveToLocalStorage();
@@ -939,11 +1207,183 @@ function setTextBgColor(color) {
     
     if (state.textEditing) {
         const editor = document.getElementById('inlineEditor');
-        editor.style.backgroundColor = color;
+        // Restore saved selection before applying highlight
+        if (state._savedSelRange) {
+            editor.focus();
+            const sel = window.getSelection();
+            sel.removeAllRanges();
+            sel.addRange(state._savedSelRange);
+        }
+        const sel = window.getSelection();
+        const hasSelection = sel && sel.rangeCount > 0 && !sel.isCollapsed;
+        if (hasSelection) {
+            document.execCommand('hiliteColor', false, color);
+            obj.richHtml = editor.innerHTML;
+            obj.text     = editor.innerText;
+        } else {
+            editor.style.backgroundColor = color;
+        }
+        saveToLocalStorage();
+        return;
     }
     
     saveToLocalStorage();
     redraw();
+}
+
+
+/**
+ * Syncs the floating format toolbar to the current browser selection.
+ * Called on every selectionchange event while the editor is open.
+ * This gives the exact PPT experience: toolbar buttons reflect the
+ * formatting AT the cursor, not just the whole text object.
+ */
+function syncToolbarToSelection() {
+    if (!state.textEditing) return;
+    
+    const toolbar = document.getElementById('floatingFormatToolbar');
+    toolbar.style.display = 'flex';
+    
+    // Always save the current selection so color pickers etc. can restore it
+    const selection = window.getSelection();
+    if (selection && selection.rangeCount > 0) {
+        state._savedSelRange = selection.getRangeAt(0).cloneRange();
+    }
+    
+    // --- Button states from live selection ---
+    const isBold      = document.queryCommandState('bold');
+    const isItalic    = document.queryCommandState('italic');
+    const isUnderline = document.queryCommandState('underline');
+
+    
+    document.getElementById('fmtBold').classList.toggle('active', isBold);
+    document.getElementById('fmtItalic').classList.toggle('active', isItalic);
+    document.getElementById('fmtUnderline').classList.toggle('active', isUnderline);
+    
+    // --- Font family from selection ---
+    const fontName = document.queryCommandValue('fontName');
+    if (fontName) {
+        const cleaned = fontName.replace(/[\'"]/g, '').split(',')[0].trim();
+        const sel = document.getElementById('fmtFontFamily');
+        for (const opt of sel.options) {
+            if (opt.value.toLowerCase() === cleaned.toLowerCase()) {
+                sel.value = opt.value;
+                break;
+            }
+        }
+    }
+    
+    // --- Font size from selection (via computed style of the focused node) ---
+    // Reuse the 'selection' variable already captured above
+
+    if (selection && selection.rangeCount > 0) {
+        let node = selection.getRangeAt(0).startContainer;
+        if (node.nodeType === Node.TEXT_NODE) node = node.parentElement;
+        if (node && node.closest('#inlineEditor')) {
+            const computed = window.getComputedStyle(node);
+            const pxSize = parseFloat(computed.fontSize);
+            if (!isNaN(pxSize)) {
+                const canvasScale = state.canvas.getBoundingClientRect().width / state.width;
+                const canvasPx = Math.round(pxSize / canvasScale);
+                // Find closest option
+                const sizeSelect = document.getElementById('fmtFontSize');
+                let closest = sizeSelect.options[0];
+                let closestDiff = Infinity;
+                for (const opt of sizeSelect.options) {
+                    const diff = Math.abs(parseInt(opt.value) - canvasPx);
+                    if (diff < closestDiff) { closestDiff = diff; closest = opt; }
+                }
+                sizeSelect.value = closest.value;
+            }
+            
+            // Color indicator
+            const col = computed.color;
+            if (col) {
+                const hex = rgbToHex(col);
+                if (hex) {
+                    document.getElementById('fmtColor').value = hex;
+                    document.getElementById('textColorIndicator').style.background = hex;
+                }
+            }
+        }
+    }
+    
+    // --- Position toolbar near selection ---
+    positionToolbarNearSelection();
+}
+
+/**
+ * Converts an rgb(r,g,b) string to #rrggbb hex.
+ */
+function rgbToHex(rgb) {
+    const m = rgb.match(/^rgb\((\d+),\s*(\d+),\s*(\d+)\)$/);
+    if (!m) return null;
+    return '#' + [m[1], m[2], m[3]].map(n => parseInt(n).toString(16).padStart(2, '0')).join('');
+}
+
+/**
+ * Positions the floating toolbar near the current text selection,
+ * exactly like PowerPoint's mini toolbar.
+ */
+function positionToolbarNearSelection() {
+    const toolbar = document.getElementById('floatingFormatToolbar');
+    const sel = window.getSelection();
+    
+    let refRect = null;
+    
+    if (sel && sel.rangeCount > 0) {
+        const range = sel.getRangeAt(0);
+        const rects = range.getClientRects();
+        if (rects.length > 0) {
+            refRect = rects[0];
+        } else {
+            refRect = range.getBoundingClientRect();
+        }
+    }
+    
+    if (!refRect || (refRect.width === 0 && refRect.height === 0)) {
+        // No visible selection — position relative to the text object box
+        if (state.textEditing) {
+            const obj = state.textEditing.obj;
+            const canvasRect = state.canvas.getBoundingClientRect();
+            const scale = canvasRect.width / state.width;
+            const box = getTextBox(obj);
+            refRect = {
+                left:   canvasRect.left + box.x * scale,
+                top:    canvasRect.top  + box.y * scale,
+                width:  box.w * scale,
+                height: 0,
+                right:  canvasRect.left + (box.x + box.w) * scale,
+                bottom: canvasRect.top  + box.y * scale
+            };
+        } else {
+            return;
+        }
+    }
+    
+    const toolbarW = toolbar.offsetWidth  || 400;
+    const toolbarH = toolbar.offsetHeight || 90;
+    const gap = 10;
+    const margin = 8;
+    
+    // Center above the selection
+    let tx = refRect.left + refRect.width / 2 - toolbarW / 2;
+    let ty = refRect.top - toolbarH - gap;
+    
+    // Clamp horizontally
+    if (tx < margin) tx = margin;
+    if (tx + toolbarW > window.innerWidth - margin) tx = window.innerWidth - toolbarW - margin;
+    
+    // If too close to top, flip below
+    if (ty < margin) {
+        ty = refRect.bottom + gap;
+        toolbar.classList.add('pos-bottom');
+    } else {
+        toolbar.classList.remove('pos-bottom');
+    }
+    
+    toolbar.style.left = tx + 'px';
+    toolbar.style.top  = ty + 'px';
 }
 
 function updateFormatToolbar(obj) {
@@ -954,52 +1394,53 @@ function updateFormatToolbar(obj) {
     }
     toolbar.style.display = 'flex';
     
-    // Position toolbar above selection with boundary checks
+    // If editor is open, defer to the live selection sync
+    if (state.textEditing && state.textEditing.obj === obj) {
+        syncToolbarToSelection();
+        return;
+    }
+    
+    // No editor open: position relative to text box on canvas
     const canvasRect = state.canvas.getBoundingClientRect();
     const scale = canvasRect.width / state.width;
     const box = getTextBox(obj);
     
-    // Estimate or get actual dimensions
-    const tw = toolbar.offsetWidth || 380;
-    const th = toolbar.offsetHeight || 85;
+    const toolbarW = toolbar.offsetWidth  || 400;
+    const toolbarH = toolbar.offsetHeight || 90;
     
-    let tx = (box.x + box.w / 2) * scale;
-    let ty = box.y * scale - th - 10; // Position ABOVE the text with gap
+    let tx = canvasRect.left + (box.x + box.w / 2) * scale - toolbarW / 2;
+    let ty = canvasRect.top  + box.y * scale - toolbarH - 10;
     
-    // Prevent bleeding off left/right
-    const halfW = tw / 2;
-    if (tx - halfW < 10) tx = halfW + 10;
-    if (tx + halfW > canvasRect.width - 10) tx = canvasRect.width - halfW - 10;
+    if (tx < 8) tx = 8;
+    if (tx + toolbarW > window.innerWidth - 8) tx = window.innerWidth - toolbarW - 8;
     
-    // Prevent bleeding off top
-    if (ty < 10) {
-        ty = (box.y + box.h) * scale + 20; // Flip to bottom below text
+    if (ty < 8) {
+        ty = canvasRect.top + (box.y + box.h) * scale + 10;
         toolbar.classList.add('pos-bottom');
     } else {
         toolbar.classList.remove('pos-bottom');
     }
-
+    
     toolbar.style.left = tx + 'px';
-    toolbar.style.top = ty + 'px';
+    toolbar.style.top  = ty + 'px';
 
+    // Reflect object-level formatting on buttons
     document.getElementById('fmtBold').classList.toggle('active', !!obj.bold);
     document.getElementById('fmtItalic').classList.toggle('active', !!obj.italic);
     document.getElementById('fmtUnderline').classList.toggle('active', !!obj.underline);
     document.getElementById('fmtBullet').classList.toggle('active', !!obj.isBullet);
     
-    document.getElementById('fmtAlignLeft').classList.toggle('active', obj.align === 'left');
+    document.getElementById('fmtAlignLeft').classList.toggle('active', obj.align === 'left' || !obj.align);
     document.getElementById('fmtAlignCenter').classList.toggle('active', obj.align === 'center');
     document.getElementById('fmtAlignRight').classList.toggle('active', obj.align === 'right');
 
-    // Update Dropdowns
     document.getElementById('fmtFontFamily').value = obj.fontFamily || 'Inter';
-    document.getElementById('fmtFontSize').value = obj.size || '18';
+    document.getElementById('fmtFontSize').value   = obj.size || '18';
 
-    // Update Indicators
-    document.getElementById('fmtColor').value = obj.color || '#000000';
+    document.getElementById('fmtColor').value  = obj.color   || '#000000';
     document.getElementById('fmtBgColor').value = obj.bgColor || '#ffffff';
-    document.getElementById('textColorIndicator').style.background = obj.color || '#000000';
-    document.getElementById('bgColorIndicator').style.background = obj.bgColor || '#ffffff';
+    document.getElementById('textColorIndicator').style.background = obj.color   || '#000000';
+    document.getElementById('bgColorIndicator').style.background   = obj.bgColor || '#ffffff';
 }
 
 function setFontFamily(font) {
@@ -1018,7 +1459,27 @@ function setFontSize(size) {
     if (!obj) return;
     obj.size = size;
     if (state.textEditing) {
-        document.getElementById('inlineEditor').style.fontSize = (size * (state.canvas.getBoundingClientRect().width / state.width)) + 'px';
+        const editor = document.getElementById('inlineEditor');
+        const sel = window.getSelection();
+        const hasSelection = sel && sel.rangeCount > 0 && !sel.isCollapsed;
+        if (hasSelection) {
+            // Wrap selection in a span with the new font size
+            const canvasScale = state.canvas.getBoundingClientRect().width / state.width;
+            editor.focus();
+            document.execCommand('fontSize', false, '7'); // placeholder size
+            // Replace the font element with a span (execCommand uses <font> tag)
+            editor.querySelectorAll('font[size="7"]').forEach(el => {
+                const span = document.createElement('span');
+                span.style.fontSize = (size * canvasScale) + 'px';
+                span.innerHTML = el.innerHTML;
+                el.replaceWith(span);
+            });
+            obj.richHtml = editor.innerHTML;
+            obj.text     = editor.innerText;
+        } else {
+            const canvasScale = state.canvas.getBoundingClientRect().width / state.width;
+            editor.style.fontSize = (size * canvasScale) + 'px';
+        }
     }
     saveToLocalStorage();
     redraw();
@@ -1027,13 +1488,9 @@ function setFontSize(size) {
 function changeFontSize(delta) {
     const obj = state.textEditing ? state.textEditing.obj : state.selectedText;
     if (!obj) return;
-    obj.size = Math.max(8, (obj.size || 18) + delta);
-    document.getElementById('fmtFontSize').value = obj.size;
-    if (state.textEditing) {
-        document.getElementById('inlineEditor').style.fontSize = (obj.size * (state.canvas.getBoundingClientRect().width / state.width)) + 'px';
-    }
-    saveToLocalStorage();
-    redraw();
+    const newSize = Math.max(8, (obj.size || 18) + delta);
+    document.getElementById('fmtFontSize').value = newSize;
+    setFontSize(newSize);
 }
 
 function changeIndent(delta) {
@@ -1055,9 +1512,14 @@ function clearFormatting() {
     obj.size = 18;
     obj.fontFamily = 'Inter';
     obj.indent = 0;
+    obj.richHtml = null; // Reset rich formatting — plain text will be used
     
     if (state.textEditing) {
         const ed = document.getElementById('inlineEditor');
+        // Strip all HTML tags, keep plain text
+        const plain = ed.innerText;
+        ed.innerText = plain;
+        obj.text = plain;
         ed.style.fontWeight = 'normal';
         ed.style.fontStyle = 'normal';
         ed.style.textDecoration = 'none';
@@ -1705,7 +2167,28 @@ function updateFileSizeDisplay() {
 }
 
 function onKeyDown(e) {
-    // Don't trigger if typing in a text field
+    // Handle Ctrl+B / Ctrl+I / Ctrl+U inside the inline editor for per-word formatting
+    if (e.target.isContentEditable && state.textEditing) {
+        if (e.ctrlKey && (e.key === 'b' || e.key === 'B')) {
+            e.preventDefault();
+            toggleFormat('bold');
+            return;
+        }
+        if (e.ctrlKey && (e.key === 'i' || e.key === 'I')) {
+            e.preventDefault();
+            toggleFormat('italic');
+            return;
+        }
+        if (e.ctrlKey && (e.key === 'u' || e.key === 'U')) {
+            e.preventDefault();
+            toggleFormat('underline');
+            return;
+        }
+        // Let all other keys (including Ctrl+Z, Ctrl+A, etc.) work natively in editor
+        return;
+    }
+
+    // Don't trigger if typing in any other text field
     if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.isContentEditable) return;
 
     if (e.ctrlKey && e.key === 'z') {
